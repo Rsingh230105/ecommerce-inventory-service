@@ -6,9 +6,13 @@ COPY requirements.txt .
 
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY . .
+RUN addgroup --system app && adduser --system --ingroup app app
+
+COPY --chown=app:app . .
 
 RUN chmod +x entrypoint.sh
+
+USER app
 
 EXPOSE 8002
 
