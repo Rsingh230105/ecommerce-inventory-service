@@ -1,0 +1,133 @@
+name: CI and deploy (dev)
+
+on:
+  push:
+    branches: [dev]
+  pull_request:
+    branches: [dev]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: inventory-dev-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: ecommerce_test
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d ecommerce_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_HOST: 127.0.0.1
+      DB_PORT: 5432
+      DB_NAME: ecommerce_test
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Apply database migrations
+        run: alembic upgrade head
+
+      - name: Run tests
+        run: python -m pytest -q
+
+      - name: Build Docker image
+        run: docker build --tag ecommerce-inventory-service:${{ github.sha }} .
+
+  deploy:
+    if: github.ref == 'refs/heads/dev' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && vars.AWS_ECR_ECS_DEPLOY_ENABLED == 'true'
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      ECR_REPOSITORY: ecommerce-dev-inventory-service
+      ECS_CLUSTER: ecommerce-dev-cluster
+      ECS_SERVICE: ecommerce-dev-inventory
+      ECS_TASK_FAMILY: ecommerce-dev-inventory
+      ECS_CONTAINER: inventory-service
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials with OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push immutable image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+
+      - name: Register task definition and deploy to ECS
+        env:
+          IMAGE_URI: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+        run: |
+          set -euo pipefail
+          aws ecs describe-task-definition \
+            --task-definition "$ECS_TASK_FAMILY" \
+            --query taskDefinition > task-definition.json
+
+          jq --arg container "$ECS_CONTAINER" --arg image "$IMAGE_URI" '
+            del(.taskDefinitionArn, .revision, .status, .requiresAttributes,
+                .compatibilities, .registeredAt, .registeredBy, .deregisteredAt)
+            | if any(.containerDefinitions[]; .name == $container) then
+                .containerDefinitions |= map(
+                  if .name == $container then .image = $image else . end
+                )
+              else
+                error("Container not found in the current ECS task definition")
+              end
+          ' task-definition.json > updated-task-definition.json
+
+          new_task_definition="$(aws ecs register-task-definition \
+            --cli-input-json file://updated-task-definition.json \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)"
+          aws ecs update-service \
+            --cluster "$ECS_CLUSTER" \
+            --service "$ECS_SERVICE" \
+            --task-definition "$new_task_definition" \
+            --query 'service.serviceName' \
+            --output text
+          aws ecs wait services-stable \
+            --cluster "$ECS_CLUSTER" \
+            --services "$ECS_SERVICE"
