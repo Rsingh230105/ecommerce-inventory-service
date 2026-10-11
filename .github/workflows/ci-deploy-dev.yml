@@ -68,7 +68,9 @@ jobs:
       id-token: write
     env:
       AWS_REGION: ${{ vars.AWS_REGION }}
+      AWS_DEPLOY_ROLE_ARN: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
       ECR_REPOSITORY: ecommerce-dev-inventory-service
+      IMAGE_TAG: ${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
       ECS_CLUSTER: ecommerce-dev-cluster
       ECS_SERVICE: ecommerce-dev-inventory
       ECS_TASK_FAMILY: ecommerce-dev-inventory
@@ -76,6 +78,12 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@v4
+
+      - name: Validate deployment configuration
+        run: |
+          set -euo pipefail
+          test -n "$AWS_REGION" || { echo "::error::Set the AWS_REGION repository variable."; exit 1; }
+          test -n "$AWS_DEPLOY_ROLE_ARN" || { echo "::error::Set the AWS_DEPLOY_ROLE_ARN repository variable."; exit 1; }
 
       - name: Configure AWS credentials with OIDC
         uses: aws-actions/configure-aws-credentials@v4
@@ -95,11 +103,11 @@ jobs:
         with:
           context: .
           push: true
-          tags: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+          tags: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
 
       - name: Register task definition and deploy to ECS
         env:
-          IMAGE_URI: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+          IMAGE_URI: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
         run: |
           set -euo pipefail
           aws ecs describe-task-definition \
